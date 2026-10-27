@@ -87,6 +87,10 @@ except ImportError:
 parser = argparse.ArgumentParser(description="MITRE ATT&CK SPARQL MCP Server v1.0.0")
 parser.add_argument("--rdf-file", default="", help="Path to the local RDF file containing MITRE ATT&CK data")
 parser.add_argument("--sparql-endpoint", default="", help="SPARQL endpoint URL (empty for Local File Mode)")
+# Hybrid mode: pass BOTH. ATT&CK queries then run on the local file and
+# CVE/CVSS/CWE/CAPEC queries (anything using those vocabularies) on the
+# endpoint; an unreachable endpoint only disables the CVE tools instead of
+# stopping the server. See mcp-cskg-rdf/build_attack_rdf.py for why.
 args = parser.parse_args()
 
 logger.info("Starting MITRE ATT&CK SPARQL MCP Server v1.0.0")
@@ -135,50 +139,75 @@ async def attack_triplestore_lifespan(server: FastMCP, rdf_file: str, sparql_end
         Dict[str, Any]: Context dictionary containing the graph and configuration.
     """
     logger.info(f"Initializing MITRE ATT&CK triplestore with rdf_file={rdf_file}, sparql_endpoint={sparql_endpoint}")
-    
+
     metrics = {"queries": 0, "total_time": 0.0}
     max_tokens = 10000
-    
-    if sparql_endpoint and HAS_SPARQLSTORE:
-        logger.info(f"Connecting to SPARQL endpoint: {sparql_endpoint}")
-        try:
-            graph = SPARQLStore(query_endpoint=sparql_endpoint)
-            # Test connection
-            graph.query("SELECT ?s WHERE { ?s ?p ?o } LIMIT 1")
-            logger.info(f"Successfully connected to {sparql_endpoint}")
-        except Exception as e:
-            logger.error(f"Failed to connect to SPARQL endpoint: {_describe_error(e)}")
-            raise
-    else:
-        graph = rdflib.Graph()
+    local_graph = remote_graph = None
+    remote_error = None
+    file_path = ""
+
+    if rdf_file:
+        local_graph = rdflib.Graph()
         file_path = os.path.join(os.path.dirname(__file__), rdf_file)
         logger.info(f"Loading local RDF file: {file_path}")
         try:
-            graph.parse(file_path, format="turtle")
-            logger.info(f"Loaded {len(graph)} triples from local file")
+            local_graph.parse(file_path, format="turtle")
+            logger.info(f"Loaded {len(local_graph)} triples from local file")
         except FileNotFoundError:
             logger.error(f"RDF file not found: {file_path}")
             raise
         except Exception as e:
             logger.error(f"Failed to load RDF file: {str(e)}")
-            raise    
+            raise
+
+    if sparql_endpoint and HAS_SPARQLSTORE:
+        logger.info(f"Connecting to SPARQL endpoint: {sparql_endpoint}")
+        try:
+            remote_graph = SPARQLStore(query_endpoint=sparql_endpoint)
+            # Test connection
+            remote_graph.query("SELECT ?s WHERE { ?s ?p ?o } LIMIT 1")
+            logger.info(f"Successfully connected to {sparql_endpoint}")
+        except Exception as e:
+            remote_error = _describe_error(e)
+            if local_graph is None:
+                logger.error(f"Failed to connect to SPARQL endpoint: {remote_error}")
+                raise
+            # Hybrid mode: ATT&CK still works from the local file.
+            logger.warning(f"SPARQL endpoint unavailable, CVE tools disabled until restart: {remote_error}")
+            remote_graph = None
+
+    if local_graph is None and remote_graph is None:
+        raise ValueError("No knowledge graph configured: pass --rdf-file, --sparql-endpoint, or both.")
+
     try:
-        graph = _eval_support.CachedGraph(graph, sparql_endpoint or str(file_path))
+        local = _eval_support.CachedGraph(local_graph, str(file_path)) if local_graph is not None else None
+        remote = _eval_support.CachedGraph(remote_graph, sparql_endpoint) if remote_graph is not None else None
+        # "graph" answers ATT&CK queries; "cve_graph" answers CVE-family
+        # queries (None = configured but unreachable, see remote_error).
+        graph = local or remote
+        if local is not None and sparql_endpoint:
+            cve_graph = remote
+        else:
+            cve_graph = graph
         logger.info("MITRE ATT&CK triplestore initialized successfully")
         yield {
             "graph": graph,
+            "cve_graph": cve_graph,
+            "cve_error": remote_error,
             "metrics": metrics,
             "max_tokens": max_tokens,
             "rdf_file": rdf_file,
             "sparql_endpoint": sparql_endpoint,
-            "is_sparql_endpoint": bool(sparql_endpoint and HAS_SPARQLSTORE)
+            # True when ATT&CK queries go to the remote endpoint (picks the
+            # cheaper statistics query); False when a local file is loaded.
+            "is_sparql_endpoint": local is None,
         }
     finally:
         logger.info("Shutting down MITRE ATT&CK triplestore connection")
-        if sparql_endpoint and HAS_SPARQLSTORE:
+        if remote_graph is not None:
             try:
-                graph.close()
-            except:
+                remote_graph.close()
+            except Exception:
                 pass
 
 MAX_DESCRIPTION_CHARS = 400
@@ -363,6 +392,21 @@ def set_max_tokens(tokens: int, ctx: Context) -> str:
     logger.info(f"Set MAX_TOKENS to {tokens}")
     return f"MAX_TOKENS set to {tokens}"
 
+_CVE_FAMILY = re.compile(r"w3id\.org/sepses/vocab/ref/(?:cve|cvss|cwe|capec|cpe|icsa)#")
+_ATTACK_VOCAB = re.compile(r"w3id\.org/sepses/vocab/ref/attack#")
+
+
+def _graph_for(query: str, lifespan: Dict[str, Any]):
+    """In hybrid mode, CVE-family queries go to the endpoint and everything
+    else (ATT&CK) to the local file. A query mixing both vocabularies stays
+    local: the two sources cannot be joined in one query."""
+    if lifespan.get("cve_graph") is lifespan["graph"]:
+        return lifespan["graph"]
+    if _CVE_FAMILY.search(query) and not _ATTACK_VOCAB.search(query):
+        return lifespan.get("cve_graph")
+    return lifespan["graph"]
+
+
 @mcp.tool()
 def execute_sparql_query(query: str, ctx: Context, include_description: bool = False) -> str:
     """Execute a custom SPARQL query against the MITRE ATT&CK knowledge graph.
@@ -375,10 +419,14 @@ def execute_sparql_query(query: str, ctx: Context, include_description: bool = F
     Returns:
         Formatted query results
     """
-    graph = ctx.request_context.lifespan_context["graph"]
+    lifespan = ctx.request_context.lifespan_context
+    graph = _graph_for(query, lifespan)
+    if graph is None:
+        return ("Error executing SPARQL query: the CVE/CVSS knowledge base "
+                f"({lifespan['sparql_endpoint']}) is unreachable: {lifespan.get('cve_error')}")
     start_time = time.time()
     bounded_query = cap_select_query(query)
-    
+
     try:
         results = graph.query(bounded_query)
         ctx.request_context.lifespan_context["metrics"]["queries"] += 1
@@ -403,6 +451,11 @@ def get_server_mode(ctx: Context) -> str:
     sparql_endpoint = ctx.request_context.lifespan_context["sparql_endpoint"]
     is_sparql_endpoint = ctx.request_context.lifespan_context["is_sparql_endpoint"]
     
+    if rdf_file and sparql_endpoint:
+        cve_state = "reachable" if ctx.request_context.lifespan_context.get("cve_graph") is not None else \
+            f"UNREACHABLE ({ctx.request_context.lifespan_context.get('cve_error')})"
+        return (f"Hybrid Mode: ATT&CK from local file '{rdf_file}'; CVE/CVSS from endpoint "
+                f"'{sparql_endpoint}' ({cve_state})")
     if is_sparql_endpoint:
         return f"SPARQL Endpoint Mode with Endpoint: '{sparql_endpoint}'"
     else:
@@ -419,63 +472,28 @@ def get_attack_statistics(ctx: Context) -> str:
         JSON string containing statistics about the knowledge base
     """
     graph = ctx.request_context.lifespan_context["graph"]
-    is_sparql_endpoint = ctx.request_context.lifespan_context["is_sparql_endpoint"]
-    
+    # One grouped count. (The previous query combined one OPTIONAL per class,
+    # which multiplies the class sizes together -- it never finished on a
+    # real local graph.)
+    classes = {
+        "Technique": "techniqueCount", "SubTechnique": "subtechniqueCount",
+        "AdversaryGroup": "groupCount", "Software": "softwareCount", "Malware": "malwareCount",
+        "Mitigation": "mitigationCount", "Tactic": "tacticCount", "Asset": "assetCount",
+        "DataSource": "dataSourceCount", "DataComponent": "dataComponentCount",
+    }
+    values = " ".join(f"attack:{name}" for name in classes)
+    query = f"""
+    PREFIX attack: <http://w3id.org/sepses/vocab/ref/attack#>
+    SELECT ?type (COUNT(DISTINCT ?s) AS ?n) WHERE {{
+        VALUES ?type {{ {values} }}
+        ?s a ?type .
+    }}
+    GROUP BY ?type
+    """
     try:
-        if is_sparql_endpoint:
-            # For SPARQL endpoints, use limited queries to avoid timeouts
-            query = """
-            PREFIX attack: <http://w3id.org/sepses/vocab/ref/attack#>
-            SELECT 
-                (COUNT(DISTINCT ?technique) AS ?techniqueCount)
-                (COUNT(DISTINCT ?group) AS ?groupCount)
-                (COUNT(DISTINCT ?software) AS ?softwareCount)
-                (COUNT(DISTINCT ?mitigation) AS ?mitigationCount)
-                (COUNT(DISTINCT ?tactic) AS ?tacticCount)
-            WHERE {
-                OPTIONAL { ?technique a attack:Technique }
-                OPTIONAL { ?group a attack:AdversaryGroup }
-                OPTIONAL { ?software a attack:Software }
-                OPTIONAL { ?mitigation a attack:Mitigation }
-                OPTIONAL { ?tactic a attack:Tactic }
-            }
-            """
-        else:
-            # For local graphs, we can do more comprehensive statistics
-            query = """
-            PREFIX attack: <http://w3id.org/sepses/vocab/ref/attack#>
-            SELECT 
-                (COUNT(DISTINCT ?technique) AS ?techniqueCount)
-                (COUNT(DISTINCT ?subtechnique) AS ?subtechniqueCount)
-                (COUNT(DISTINCT ?group) AS ?groupCount)
-                (COUNT(DISTINCT ?software) AS ?softwareCount)
-                (COUNT(DISTINCT ?malware) AS ?malwareCount)
-                (COUNT(DISTINCT ?mitigation) AS ?mitigationCount)
-                (COUNT(DISTINCT ?tactic) AS ?tacticCount)
-                (COUNT(DISTINCT ?asset) AS ?assetCount)
-                (COUNT(DISTINCT ?dataSource) AS ?dataSourceCount)
-                (COUNT(DISTINCT ?dataComponent) AS ?dataComponentCount)
-            WHERE {
-                OPTIONAL { ?technique a attack:Technique }
-                OPTIONAL { ?subtechnique a attack:SubTechnique }
-                OPTIONAL { ?group a attack:AdversaryGroup }
-                OPTIONAL { ?software a attack:Software }
-                OPTIONAL { ?malware a attack:Malware }
-                OPTIONAL { ?mitigation a attack:Mitigation }
-                OPTIONAL { ?tactic a attack:Tactic }
-                OPTIONAL { ?asset a attack:Asset }
-                OPTIONAL { ?dataSource a attack:DataSource }
-                OPTIONAL { ?dataComponent a attack:DataComponent }
-            }
-            """
-        
-        results = graph.query(query)
-        stats = {}
-        for row in results:
-            for var_name, value in row.asdict().items():
-                if value is not None:
-                    stats[var_name] = int(value)
-        
+        stats = {key: 0 for key in classes.values()}
+        for row in graph.query(query):
+            stats[classes[str(row.type).rsplit("#", 1)[-1]]] = int(row.n)
         return json.dumps(stats, indent=2)
     except Exception as e:
         logger.error(f"Statistics query error: {str(e)}")
@@ -491,14 +509,24 @@ def health_check(ctx: Context) -> str:
     Returns:
         Health status message
     """
-    graph = ctx.request_context.lifespan_context["graph"]
+    lifespan = ctx.request_context.lifespan_context
+    graph = lifespan["graph"]
     try:
         # Simple test query
         results = list(graph.query("SELECT ?s WHERE { ?s ?p ?o } LIMIT 1"))
-        return "Healthy - MITRE ATT&CK triplestore is responsive"
     except Exception as e:
         logger.error(f"Health check error: {str(e)}")
         return f"Unhealthy: {str(e)}"
+    if lifespan.get("cve_graph") is graph:
+        return "Healthy - MITRE ATT&CK triplestore is responsive"
+    if lifespan.get("cve_graph") is None:
+        return ("Degraded - MITRE ATT&CK (local file) is responsive; the CVE/CVSS endpoint is unreachable: "
+                f"{lifespan.get('cve_error')}")
+    try:
+        list(lifespan["cve_graph"].query("SELECT ?s WHERE { ?s ?p ?o } LIMIT 1"))
+        return "Healthy - MITRE ATT&CK (local file) and the CVE/CVSS endpoint are responsive"
+    except Exception as e:
+        return f"Degraded - MITRE ATT&CK (local file) is responsive; the CVE/CVSS endpoint failed: {_describe_error(e)}"
 
 #################################################################
 # Technique Query Tools
@@ -1307,161 +1335,158 @@ async def get_group_capabilities(group_name: str, ctx: Context, include_descript
 #################################################################
 # CVE Query Tools
 #################################################################
+# Written for the SEPSES-KG schema served at https://sepses.org/sparql
+# (verified 2026-10-26): CVE IRIs are .../resource/cve/<CVE-ID> with
+# dcterms:identifier/description/issued/modified and cve:hasReference;
+# CVSS v3 records are NOT linked from the CVE but sit at the parallel IRI
+# .../resource/cvss/CVSS3BaseMetric/<CVE-ID>, with a numeric cvss:baseScore,
+# cvss:baseSeverity and cvss:vectorString. CVSS v2 is no longer present.
+
+_CVE_PREFIXES = """
+    PREFIX cve: <http://w3id.org/sepses/vocab/ref/cve#>
+    PREFIX cvss: <http://w3id.org/sepses/vocab/ref/cvss#>
+    PREFIX dcterms: <http://purl.org/dc/terms/>
+    PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+"""
+_CVE_IRI = "http://w3id.org/sepses/resource/cve/"
+_CVSS3_IRI = "http://w3id.org/sepses/resource/cvss/CVSS3BaseMetric/"
+_CVE_ID_RE = re.compile(r"^CVE-\d{4}-\d{4,}$")
+# From a CVSS v3 record to its CVE (cheap: filters on the score first).
+_CVSS_TO_CVE = f'BIND(IRI(CONCAT("{_CVE_IRI}", STRAFTER(STR(?cvss3), "/CVSS3BaseMetric/"))) AS ?cve)'
+# From a CVE to its (optional) CVSS v3 score and severity. The BIND must sit
+# outside the OPTIONAL: inside it, ?cve is not yet bound and the join
+# silently pairs every CVE with every CVSS record.
+_CVE_TO_CVSS = (f'BIND(IRI(CONCAT("{_CVSS3_IRI}", STRAFTER(STR(?cve), "/cve/"))) AS ?cvss3) '
+                f'OPTIONAL {{ ?cvss3 cvss:baseScore ?baseScore . '
+                f'OPTIONAL {{ ?cvss3 cvss:baseSeverity ?sev }} }}')
+
+
+def _normalize_cve_id(cve_id: str) -> Optional[str]:
+    normalized = (cve_id or "").strip().upper()
+    return normalized if _CVE_ID_RE.match(normalized) else None
+
+
+def _literal(text: str) -> str:
+    """Escape user text for a SPARQL string literal."""
+    return (text or "").replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ")
+
 
 @mcp.tool()
 def get_all_cves(ctx: Context, include_description: bool = False) -> str:
-    """Get all CVEs in the knowledge base.
-    
+    """Get a sample of CVEs in the knowledge base (first 50).
+
     Args:
         ctx: FastMCP context object
         include_description: Whether to include descriptions (default: False)
     """
-    query = """
-    PREFIX cve: <http://w3id.org/sepses/vocab/ref/cve#>
-    PREFIX dcterms: <http://purl.org/dc/terms/>
-    
-    SELECT ?cve ?description WHERE {
-        ?cve a cve:CVE .
+    query = _CVE_PREFIXES + """
+    SELECT ?cveId ?description WHERE {
+        ?cve a cve:CVE ; dcterms:identifier ?cveId .
         OPTIONAL { ?cve dcterms:description ?description }
     }
-    ORDER BY ?cve
     LIMIT 50
     """
     return execute_sparql_query(query, ctx, include_description)
 
 @mcp.tool()
 def get_cve_by_id(cve_id: str, ctx: Context, include_description: bool = False) -> str:
-    """Get detailed information about a specific CVE.
-    
+    """Get detailed information about a specific CVE, including its CVSS v3 score.
+
     Args:
         cve_id: CVE identifier (e.g., CVE-2023-1234)
         ctx: FastMCP context object
         include_description: Whether to include descriptions (default: False)
     """
-    query = f"""
-    PREFIX cve: <http://w3id.org/sepses/vocab/ref/cve#>
-    PREFIX dcterms: <http://purl.org/dc/terms/>
-    
-    SELECT ?cve ?description ?publishedDate ?modifiedDate WHERE {{
+    normalized = _normalize_cve_id(cve_id)
+    if not normalized:
+        return f"Error: {cve_id!r} is not a CVE identifier (expected e.g. CVE-2021-44228)."
+    query = _CVE_PREFIXES + f"""
+    SELECT ?cveId ?description ?publishedDate ?modifiedDate ?baseScore ?severity ?vector WHERE {{
+        VALUES ?cve {{ <{_CVE_IRI}{normalized}> }}
         ?cve a cve:CVE .
-        FILTER(CONTAINS(STR(?cve), "{cve_id}"))
+        BIND("{normalized}" AS ?cveId)
         OPTIONAL {{ ?cve dcterms:description ?description }}
-        OPTIONAL {{ ?cve dcterms:created ?publishedDate }}
+        OPTIONAL {{ ?cve dcterms:issued ?publishedDate }}
         OPTIONAL {{ ?cve dcterms:modified ?modifiedDate }}
+        OPTIONAL {{
+            <{_CVSS3_IRI}{normalized}> cvss:baseScore ?baseScore .
+            OPTIONAL {{ <{_CVSS3_IRI}{normalized}> cvss:vectorString ?vector }}
+            OPTIONAL {{ <{_CVSS3_IRI}{normalized}> cvss:baseSeverity ?sev }}
+        }}
+        BIND(REPLACE(STR(?sev), "^.*/", "") AS ?severity)
     }}
     """
-    
     return execute_sparql_query(query, ctx, include_description)
 
 @mcp.tool()
 def search_cves_by_keyword(keyword: str, ctx: Context, include_description: bool = False) -> str:
-    """Search CVEs by keyword in title or description.
-    
+    """Search CVEs by keyword in their description (first 50 matches).
+
     Args:
         keyword: Keyword to search for
         ctx: FastMCP context object
         include_description: Whether to include descriptions (default: False)
     """
-    query = f"""
-    PREFIX cve: <http://w3id.org/sepses/vocab/ref/cve#>
-    PREFIX dcterms: <http://purl.org/dc/terms/>
-    
-    SELECT ?cve ?description WHERE {{
-        ?cve a cve:CVE .
-        OPTIONAL {{ ?cve dcterms:description ?description }}
-        FILTER(
-            CONTAINS(LCASE(?description), LCASE("{keyword}"))
-        )
+    query = _CVE_PREFIXES + f"""
+    SELECT ?cveId ?description WHERE {{
+        ?cve a cve:CVE ; dcterms:identifier ?cveId ; dcterms:description ?description .
+        FILTER(CONTAINS(LCASE(?description), LCASE("{_literal(keyword)}")))
     }}
-    ORDER BY ?cve
     LIMIT 50
     """
-    
     return execute_sparql_query(query, ctx, include_description)
 
 #################################################################
 # CVSS Query Tools
 #################################################################
 
+def _cves_by_score(ctx: Context, minimum: float, maximum: float, include_description: bool) -> str:
+    query = _CVE_PREFIXES + f"""
+    SELECT ?cveId ?baseScore ?severity ?description WHERE {{
+        ?cvss3 a cvss:CVSS3BaseMetric ; cvss:baseScore ?baseScore .
+        FILTER(xsd:decimal(?baseScore) >= {float(minimum)} && xsd:decimal(?baseScore) <= {float(maximum)})
+        OPTIONAL {{ ?cvss3 cvss:baseSeverity ?sev }}
+        BIND(REPLACE(STR(?sev), "^.*/", "") AS ?severity)
+        BIND(STRAFTER(STR(?cvss3), "/CVSS3BaseMetric/") AS ?cveId)
+        {_CVSS_TO_CVE}
+        OPTIONAL {{ ?cve dcterms:description ?description }}
+    }}
+    ORDER BY DESC(?baseScore)
+    LIMIT 50
+    """
+    return execute_sparql_query(query, ctx, include_description)
+
 @mcp.tool()
 def get_cves_by_cvss_score(min_score: float, max_score: float, ctx:Context, include_description: bool = False) -> str:
-    """Get CVEs within a specific CVSS score range.
-    
+    """Get CVEs within a specific CVSS v3 base-score range (highest first, max 50).
+
     Args:
         min_score: Minimum CVSS score
         max_score: Maximum CVSS score
         ctx: FastMCP context object
         include_description: Whether to include descriptions (default: False)
     """
-    query = f"""
-        PREFIX cve: <http://w3id.org/sepses/vocab/ref/cve#>
-        PREFIX cvss: <http://w3id.org/sepses/vocab/ref/cvss#>
-        PREFIX dcterms: <http://purl.org/dc/terms/>
-        PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
-        
-        SELECT ?cve ?description ?baseScore WHERE {{
-            ?cve a cve:CVE .
-            ?cve cve:hasCVSS3BaseMetric ?cvss3 .
-            ?cvss3 cvss:baseScore ?baseScore .
-            OPTIONAL {{ ?cve dcterms:description ?description }}
-            FILTER(xsd:integer(?baseScore) >= {min_score} && xsd:integer(?baseScore) <= {max_score})
-        }}
-        ORDER BY DESC(?baseScore)
-        """
-    
-    return execute_sparql_query(query, ctx, include_description)
+    return _cves_by_score(ctx, min_score, max_score, include_description)
 
 @mcp.tool()
 def get_high_severity_cves(ctx: Context, include_description: bool = False) -> str:
-    """Get CVEs with high severity (CVSS score >= 7.0).
-    
+    """Get CVEs with high severity (CVSS v3 score >= 7.0; highest first, max 50).
+
     Args:
         ctx: FastMCP context object
         include_description: Whether to include descriptions (default: False)
     """
-    query = """
-    PREFIX cve: <http://w3id.org/sepses/vocab/ref/cve#>
-    PREFIX cvss: <http://w3id.org/sepses/vocab/ref/cvss#>
-    PREFIX dcterms: <http://purl.org/dc/terms/>
-    
-    SELECT ?cve ?description ?baseScore WHERE {
-        ?cve a cve:CVE .
-            ?cve cve:hasCVSS3BaseMetric ?cvss3 .
-            ?cvss3 cvss:baseScore ?baseScore .
-        OPTIONAL { ?cve dcterms:description ?description }
-        FILTER(xsd:integer(?baseScore) >= 7.0)
-    }
-    ORDER BY DESC(?baseScore)
-    LIMIT 50
-    """
-    
-    return execute_sparql_query(query, ctx, include_description)
+    return _cves_by_score(ctx, 7.0, 10.0, include_description)
 
 @mcp.tool()
 def get_critical_cves(ctx: Context, include_description: bool = False) -> str:
-    """Get CVEs with critical severity (CVSS score >= 9.0).
-    
+    """Get CVEs with critical severity (CVSS v3 score >= 9.0; highest first, max 50).
+
     Args:
         ctx: FastMCP context object
         include_description: Whether to include descriptions (default: False)
     """
-    query = """
-    PREFIX cve: <http://w3id.org/sepses/vocab/ref/cve#>
-    PREFIX cvss: <http://w3id.org/sepses/vocab/ref/cvss#>
-    PREFIX dcterms: <http://purl.org/dc/terms/>
-    
-    SELECT ?cve ?description ?baseScore WHERE {
-        ?cve a cve:CVE .
-            ?cve cve:hasCVSS3BaseMetric ?cvss3 .
-            ?cvss3 cvss:baseScore ?baseScore .
-        OPTIONAL { ?cve dcterms:description ?description }
-        FILTER(xsd:integer(?baseScore) >= 9.0)
-    }
-    ORDER BY DESC(?baseScore)
-    LIMIT 50
-    """
-    
-    return execute_sparql_query(query, ctx, include_description)
+    return _cves_by_score(ctx, 9.0, 10.0, include_description)
 
 #################################################################
 # Reference Query Tools
@@ -1469,107 +1494,72 @@ def get_critical_cves(ctx: Context, include_description: bool = False) -> str:
 
 @mcp.tool()
 def get_references_for_cve(cve_id: str, ctx: Context, include_description: bool = False) -> str:
-    """Get all references for a specific CVE.
-    
+    """Get the reference URLs (advisories, patches, exploits) for a specific CVE.
+
     Args:
         cve_id: CVE identifier (e.g., CVE-2023-1234)
         ctx: FastMCP context object
         include_description: Whether to include descriptions (default: False)
     """
-    query = f"""
-    PREFIX cve: <http://w3id.org/sepses/vocab/ref/cve#>
-    PREFIX dcterms: <http://purl.org/dc/terms/>
-    
-    SELECT ?cve ?reference ?referenceUrl ?referenceSource ?referenceType WHERE {{
-        ?cve a cve:CVE .
-        ?cve cve:hasReference ?reference .
-        FILTER(CONTAINS(STR(?cve), "{cve_id}"))
-        OPTIONAL {{ ?reference cve:referenceUrl ?referenceUrl }}
+    normalized = _normalize_cve_id(cve_id)
+    if not normalized:
+        return f"Error: {cve_id!r} is not a CVE identifier (expected e.g. CVE-2021-44228)."
+    # One reference node per CVE holds all URLs, sources and tag lists as
+    # separate values, so tags cannot be paired with individual URLs.
+    query = _CVE_PREFIXES + f"""
+    SELECT DISTINCT ?referenceUrl ?referenceSource WHERE {{
+        <{_CVE_IRI}{normalized}> cve:hasReference ?reference .
+        ?reference cve:referenceUrl ?referenceUrl .
         OPTIONAL {{ ?reference cve:referenceSource ?referenceSource }}
-        OPTIONAL {{ ?reference cve:referenceType ?referenceType }}
     }}
-    ORDER BY ?reference
+    ORDER BY ?referenceUrl
     """
-    
     return execute_sparql_query(query, ctx, include_description)
 
 #################################################################
 # Time-based Query Tools
 #################################################################
 
-@mcp.tool()
-def get_recent_cves(days: int = 30, include_description: bool = False) -> str:
-    """Get CVEs published in the last N days.
-    
-    Args:
-        days: Number of days to look back (default: 30)
-        ctx: FastMCP context object
-        include_description: Whether to include descriptions (default: False)
-    """
-    query = f"""
-    PREFIX cve: <http://w3id.org/sepses/vocab/ref/cve#>
-    PREFIX dcterms: <http://purl.org/dc/terms/>
-    PREFIX cvss: <http://w3id.org/sepses/vocab/ref/cvss#>
-    
-    SELECT ?cve ?title ?publishedDate ?baseScore WHERE {{
-        ?cve a cve:CVE .
-        ?cve dcterms:created ?publishedDate .
-        OPTIONAL {{ ?cve dcterms:title ?title }}
-        
-        OPTIONAL {{
-            {{
-                ?cve cve:hasCVSS3BaseMetric ?cvss3 .
-                ?cvss3 cvss:baseScore ?baseScore .
-            }} UNION {{
-                ?cve cve:hasCVSS2BaseMetric ?cvss2 .
-                ?cvss2 cvss:baseScore ?baseScore .
-            }}
-        }}
-        
-        FILTER(?publishedDate >= (NOW() - "P{days}D"^^xsd:duration))
+def _cves_published_between(ctx: Context, start: str, end: Optional[str], include_description: bool) -> str:
+    upper = f' && ?publishedDate < "{end}"^^xsd:dateTime' if end else ""
+    query = _CVE_PREFIXES + f"""
+    SELECT ?cveId ?publishedDate ?baseScore ?severity ?description WHERE {{
+        ?cve a cve:CVE ; dcterms:issued ?publishedDate ; dcterms:identifier ?cveId .
+        FILTER(?publishedDate >= "{start}"^^xsd:dateTime{upper})
+        OPTIONAL {{ ?cve dcterms:description ?description }}
+        {_CVE_TO_CVSS}
+        BIND(REPLACE(STR(?sev), "^.*/", "") AS ?severity)
     }}
-    ORDER BY DESC(?publishedDate) DESC(?baseScore)
+    ORDER BY DESC(?publishedDate)
     LIMIT 100
     """
-    
-    return execute_sparql_query(query, include_description)
+    return execute_sparql_query(query, ctx, include_description)
+
+@mcp.tool()
+def get_recent_cves(ctx: Context, days: int = 30, include_description: bool = False) -> str:
+    """Get CVEs published in the last N days (newest first, max 100).
+
+    Args:
+        ctx: FastMCP context object
+        days: Number of days to look back (default: 30)
+        include_description: Whether to include descriptions (default: False)
+    """
+    from datetime import datetime, timedelta, timezone
+    days = max(1, int(days))
+    start = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S")
+    return _cves_published_between(ctx, start, None, include_description)
 
 @mcp.tool()
 def get_cves_by_year(year: int, ctx: Context, include_description: bool = False) -> str:
-    """Get CVEs published in a specific year.
-    
+    """Get CVEs published in a specific year (newest first, max 100).
+
     Args:
         year: Year to filter by (e.g., 2023)
         ctx: FastMCP context object
         include_description: Whether to include descriptions (default: False)
     """
-    query = f"""
-    PREFIX cve: <http://w3id.org/sepses/vocab/ref/cve#>
-    PREFIX dcterms: <http://purl.org/dc/terms/>
-    PREFIX cvss: <http://w3id.org/sepses/vocab/ref/cvss#>
-    
-    SELECT ?cve ?title ?publishedDate ?baseScore WHERE {{
-        ?cve a cve:CVE .
-        ?cve dcterms:created ?publishedDate .
-        OPTIONAL {{ ?cve dcterms:title ?title }}
-        
-        OPTIONAL {{
-            {{
-                ?cve cve:hasCVSS3BaseMetric ?cvss3 .
-                ?cvss3 cvss:baseScore ?baseScore .
-            }} UNION {{
-                ?cve cve:hasCVSS2BaseMetric ?cvss2 .
-                ?cvss2 cvss:baseScore ?baseScore .
-            }}
-        }}
-        
-        FILTER(YEAR(?publishedDate) = {year})
-    }}
-    ORDER BY DESC(?publishedDate) DESC(?baseScore)
-    LIMIT 500
-    """
-    
-    return execute_sparql_query(query, ctx, include_description)
+    year = int(year)
+    return _cves_published_between(ctx, f"{year}-01-01T00:00:00", f"{year + 1}-01-01T00:00:00", include_description)
 
 #################################################################
 # Free-form fallback: text -> SPARQL
@@ -1612,9 +1602,13 @@ follow these shapes exactly, don't invent alternate predicate names:
     attack:preventsTechnique ?technique .
     (equivalently, from the technique side: ?technique attack:hasMitigation ?mitigation)
   ?software a attack:Software|attack:Malware ; dcterm:title ?label .
-  ?cve a cve:CVE ; dcterms:description ?desc ; dcterms:created ?published ;
-    dcterms:modified ?modified ; cve:hasCVSS3BaseMetric ?cvss3 .
-    ?cvss3 cvss:baseScore ?baseScore .
+  ?cve a cve:CVE ; dcterms:identifier ?cveId ; dcterms:description ?desc ;
+    dcterms:issued ?published ; dcterms:modified ?modified .
+  CVSS v3 is NOT linked from the CVE: it sits at the parallel IRI
+    <http://w3id.org/sepses/resource/cvss/CVSS3BaseMetric/CVE-2021-44228>
+    with cvss:baseScore (numeric) and cvss:baseSeverity. Join with
+    BIND(IRI(CONCAT("http://w3id.org/sepses/resource/cvss/CVSS3BaseMetric/",
+    STRAFTER(STR(?cve), "/cve/"))) AS ?cvss3).
 
 Rules, matching this knowledge base's own conventions:
   - Match technique/tactic/group/mitigation/software NAMES via
@@ -1623,8 +1617,10 @@ Rules, matching this knowledge base's own conventions:
   - Match a technique by its ATT&CK ID (e.g. "T1110") via
     FILTER(STRENDS(STR(?technique), "/T1110")) -- the ID is the URI's last
     path segment, not a literal property value.
-  - ?baseScore is stored as a string; cast with xsd:integer(?baseScore)
-    before numeric comparison (declare PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>).
+  - Compare ?baseScore numerically with xsd:decimal(?baseScore)
+    (declare PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>).
+  - Never mix ATT&CK and CVE patterns in one query: the two live in
+    different stores (ATT&CK local file, CVE remote endpoint).
   - Always SELECT human-readable ?label/?title variables alongside any URI
     variable -- raw URIs are not useful to a downstream reader.
   - This knowledge base has NO IP addresses, hostnames, domains, live

@@ -4,7 +4,8 @@
       "command": "${CURRENT_PYTHON}",
       "args": [
         "${PROJECT_ROOT}/mcp-cskg-rdf/src/mcp-cskg-rdf/server.py",
-        "--sparql-endpoint", "https://w3id.org/sepses/sparql"
+        "--rdf-file", "${PROJECT_ROOT}/mcp-cskg-rdf/data/attack-enterprise-16.1.ttl",
+        "--sparql-endpoint", "https://sepses.org/sparql"
       ]
     }
   }

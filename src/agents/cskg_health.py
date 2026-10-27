@@ -326,6 +326,11 @@ def check_sparql_endpoint(args: List[str], timeout: float = 30.0) -> Dict[str, A
             body = response.read(4096)
             status, final = response.status, response.geturl()
     except Exception as exc:
+        if _arg_value(args, "--rdf-file"):
+            return _stage("sparql_endpoint", False, started,
+                          f"{endpoint} did not answer a trivial query (hybrid mode: ATT&CK is served from the "
+                          f"local file; only the CVE/CVSS tools are affected)", error=exc,
+                          remediation="External service. Check the network path and retry later.")
         return _stage("sparql_endpoint", False, started, f"{endpoint} did not answer a trivial query", error=exc,
                       remediation="External service. Check the network path and retry later; the server also "
                                   "supports a local copy via --rdf-file.")
