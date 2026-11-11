@@ -86,10 +86,10 @@ from src.graph.state import AgentState
 from src.agents.guardrails_agent import guardrails_chain, _render_alert_context
 from src.agents.question_generation_agent import generate_questions
 from src.agents.review_agent import review_chain
-from src.agents.synthesizer_agent import synthesis_chain, synthesis_chain_fast, SynthesizedReport
+from src.agents.synthesizer_agent import synthesis_chain, synthesis_chain_fast, SynthesizedReport, answer_format
 from src.agents.vector_agent import query_vector_search
 from src.agents.cypher_agent import query_cypher
-from src.agents.mcp_rdf_agent import NO_DATA_MARKER as _MCP_NO_DATA_MARKER, run_mcp_agent
+from src.agents.mcp_rdf_agent import NO_DATA_MARKER as _MCP_NO_DATA_MARKER, run_mcp_agent, start_trace as _start_cskg_trace
 from src.agents.grounding_check import (
     apply_claim_verdicts, apply_self_assessment, case_context_alerts, retry_note as _validation_retry_note,
     summarize_claims, validate_report, validation_adjustments,
@@ -224,6 +224,22 @@ def _retrieval_failed(result: dict) -> bool:
     return (result.get("retrieval") or {}).get("status") == "failed"
 
 
+def _query_error(result: dict) -> bool:
+    """The source was reachable, but the agent's own generated query was
+    rejected (Cypher syntax/semantics, schema, placeholder anchor) on every
+    attempt. That is a result of the pipeline under test -- it is recorded
+    in the turn and counted -- not a dependency outage that invalidates the
+    turn. It is never negative evidence either."""
+    return (result.get("retrieval") or {}).get("status") == "query_error"
+
+
+def _is_generation_fault(source: str, exc: BaseException) -> bool:
+    if source != "cypher":
+        return False
+    from src.retrieval import scoped_fetch
+    return isinstance(exc, ValueError) or scoped_fetch.is_cypher_syntax_error(exc)
+
+
 def _has_case_evidence(result: dict) -> bool:
     return bool((result.get("evidence") or {}).get("case_alert_ids") or (result.get("evidence") or {}).get("case_rows"))
 
@@ -237,6 +253,7 @@ def _source_status(results: list) -> dict:
     for source in _SOURCES:
         mine = [r for r in results if r.get("source") == source]
         failed = [r for r in mine if _retrieval_failed(r)]
+        query_errors = [r for r in mine if _query_error(r)]
         if not mine:
             state = "not_queried"
         elif not failed:
@@ -244,7 +261,10 @@ def _source_status(results: list) -> dict:
         else:
             state = "failed" if len(failed) == len(mine) else "partial_failure"
         status[source] = {"status": state, "questions": len(mine), "failed": len(failed),
-                          "errors": sorted({f"{r['retrieval']['error_type']}: {r['retrieval']['message']}" for r in failed})}
+                          "errors": sorted({f"{r['retrieval']['error_type']}: {r['retrieval']['message']}" for r in failed}),
+                          "query_errors": len(query_errors),
+                          "query_error_messages": sorted({f"{r['retrieval']['error_type']}: {r['retrieval']['message'][:300]}"
+                                                          for r in query_errors})}
     return status
 
 
@@ -336,6 +356,11 @@ def guardrails_node(state: AgentState):
 
 
 # --- Node Definition: Question Generation ---
+# The ID tool returns one row per technique, so this stays within the
+# server's row cap; sorted order keeps the selection deterministic.
+MITIGATION_LOOKUP_MAX_IDS = 10
+
+
 def _guaranteed_mitigation_question(state: AgentState) -> dict | None:
     """Deterministic (non-LLM) mitigation-lookup question, appended to
     whatever question_generation produced this turn -- guarantees
@@ -351,7 +376,7 @@ def _guaranteed_mitigation_question(state: AgentState) -> dict | None:
     techniques = state.get('known_mitre_techniques') or (state.get('alert') or {}).get('rule_mitre_id') or []
     if not techniques:
         return None
-    ids = ", ".join(sorted(set(techniques)))
+    ids = ", ".join(sorted(set(techniques))[:MITIGATION_LOOKUP_MAX_IDS])
     return {
         "hypothesis": "Standard mitigations for the identified technique(s)",
         # Only their IDs are ever known at this point (not names) -- the
@@ -362,10 +387,8 @@ def _guaranteed_mitigation_question(state: AgentState) -> dict | None:
         # it out here too, per-question, is extra reinforcement specifically
         # because this exact question caused that failure once already).
         "question": (
-            f"What are the recommended mitigations for MITRE ATT&CK technique(s) {ids}? "
-            f"Only the ID(s) are known, not the technique name(s) -- first resolve each ID via "
-            f"get_technique_by_id to get its name, then look up mitigations by that name via "
-            f"get_mitigations_for_technique (or use text_to_sparql to query by ID directly)."
+            f"What are the recommended mitigations for MITRE ATT&CK technique ID(s) {ids}? "
+            f"Use get_mitigations_for_technique_ids with exactly these IDs."
         ),
         "source": "cskg",
         "rationale": "Guaranteed lookup (not LLM-chosen) so mitigation_suggestions is grounded in "
@@ -452,14 +475,25 @@ async def dispatch_retrieval_node(state: AgentState):
                     timeout=CYPHER_NODE_CALL_TIMEOUT_SECONDS)
             return cypher_result.get("context", [])
         elif source == "cskg":
+            # The trace collects every tool call of this attempt; it is
+            # attached to the question result by run_one.
+            cskg_traces.setdefault(q_text, []).append(_start_cskg_trace())
             return await asyncio.wait_for(run_mcp_agent(q_text), timeout=CSKG_NODE_CALL_TIMEOUT_SECONDS)
         else:
             return f"Unknown source tag '{source}' for this question."
 
+    cskg_traces: dict = {}
     _MAX_RETRIEVAL_ATTEMPTS = 2  # 1 bounded retry, same bound as grounding_check's synthesis retry elsewhere in this graph
     cypher_slots = asyncio.Semaphore(CYPHER_MAX_CONCURRENCY)
 
     async def run_one(gq: dict) -> dict:
+        result = await _run_one(gq)
+        if gq.get("source") == "cskg":
+            # One entry per attempt (a retried question has two).
+            result["cskg_trace"] = cskg_traces.get(gq.get("question"), [])
+        return result
+
+    async def _run_one(gq: dict) -> dict:
         """Retries only an actual retrieval *failure* (an exception --
         timeout, malformed query, missing index, etc.), never a
         legitimately empty/negative result: query_cypher/
@@ -484,6 +518,14 @@ async def dispatch_retrieval_node(state: AgentState):
                 break
             except Exception as e:
                 failure = _describe_failure(source, e, attempt, time.monotonic() - started)
+                if _is_generation_fault(source, e):
+                    # query_cypher already regenerated with the error shown;
+                    # rerunning the same prompt would only repeat the fault.
+                    failure["generation_fault"] = True
+                    dispatch_retrieval_logger.warning(
+                        f"({source}) {q_text!r} QUERY ERROR (agent-generated query invalid; recorded, "
+                        f"not an outage): {failure['error_type']}: {failure['message'][:300]}")
+                    break
                 # A timed-out worker thread may still be running. Retrying it
                 # here can overlap the same expensive request and amplify load.
                 retryable = not isinstance(e, TimeoutError)
@@ -502,6 +544,11 @@ async def dispatch_retrieval_node(state: AgentState):
                     f"({source}) {q_text!r} DEPENDENCY FAILURE after {attempt} attempt(s) in {failure['seconds']}s: "
                     f"{failure['error_type']}: {failure['message']}"
                     + (f" (stage: {failure['stage']})" if failure['stage'] else ""))
+        if failure and failure.get("generation_fault"):
+            context = ("QUERY ERROR -- the query generated for this question was invalid on every attempt "
+                       f"({failure['error_type']}: {failure['message'][:300]}). The question was NOT answered; "
+                       "this is NOT a negative result.")
+            return {**gq, "context": context, "retrieval": {**failure, "status": "query_error"}, "evidence": None}
         if failure:
             # Kept as a context string too (review/synthesis prompts read
             # it), but the structured `retrieval` record is what marks
@@ -549,7 +596,7 @@ async def dispatch_retrieval_node(state: AgentState):
     # they are reported through dependency_failures/source_status instead,
     # so an outage can neither count as a source "with data" nor be read
     # as "nothing found".
-    usable = [r for r in windowed if not _retrieval_failed(r)]
+    usable = [r for r in windowed if not _retrieval_failed(r) and not _query_error(r)]
 
     def _has_rows(r):  # scoped results with no rows in either channel add nothing to the context
         e = r.get("evidence")
@@ -623,6 +670,14 @@ def review_evidence_node(state: AgentState):
                 "reasoning": f"Not tested: the {r.get('source')} source could not be queried "
                              f"({failure['error_type']}: {failure['message']})."}})
             review_evidence_logger.warning(f"output: {r.get('question')!r} -> NOT TESTED (retrieval failed)")
+            continue
+        if _query_error(r):
+            failure = r["retrieval"]
+            reviewed.append({**r, "review": {
+                "sufficient": False, "hypothesis_verdict": "inconclusive",
+                "reasoning": f"Not tested: the query generated for this question was invalid "
+                             f"({failure['error_type']}: {failure['message'][:200]})."}})
+            review_evidence_logger.warning(f"output: {r.get('question')!r} -> NOT TESTED (invalid generated query)")
             continue
         review = review_chain.invoke({
             "hypothesis": r.get("hypothesis", ""),
@@ -865,6 +920,7 @@ def synthesize_node(state: AgentState):
         "retry_note": retry_note,
         "case_context": case_context,
         "conversation_context": conversation_context,
+        "answer_format": answer_format(turn_no > 1),
     })
 
     richness = _context_richness(log_cypher, log_vector, state.get('mcp_rdf_context'))

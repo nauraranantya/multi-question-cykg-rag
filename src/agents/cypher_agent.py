@@ -48,6 +48,11 @@ Following the instructions below:
         12. **CRITICAL RULE**: `MitreTechnique.tactic` is populated ONLY from the original alert's own native tag (most alerts don't have one), and when present it is always one of the ~14 standard MITRE ATT&CK tactic names verbatim (e.g. "Discovery", "Lateral Movement", "Initial Access", "Command and Control") -- it is NEVER a hypothesis's own free-text wording. Words like "scanning", "probing", or "reconnaissance" will NEVER appear in `m.tactic` even for genuinely related alerts, so `WHERE toLower(m.tactic) CONTAINS "scanning"` is guaranteed to return nothing regardless of whether relevant data exists. If the question names a SPECIFIC known technique, filter by `m.id` (e.g. `m.id = "T1046"` or `m.id STARTS WITH "T1046"`) -- that is the reliable, structured identifier. If the question is more open-ended (e.g. "does this look like scanning activity"), do NOT filter MitreTechnique by any guessed tactic text at all -- retrieve the alert's own `title`/`full_log` instead (per the guidance above) and let that content answer it.
         13. **CRITICAL RULE**: `Alert.timestamp` is a plain STRING property (ISO-8601), not a native Cypher temporal type. Comparing it directly against another ISO-8601 string works fine (e.g. `a.timestamp >= "2022-01-24T00:00:00Z"`), but a relative time window (e.g. "in the last 24 hours") requires converting it first with `datetime(a.timestamp)`. Cypher's `duration` values do NOT have a `.toMillis()` method -- that is a Java/JavaScript API, not Cypher -- so `duration('P1D').toMillis()` is invalid and will fail with a syntax error. Subtract a `duration` directly from a `datetime` instead, e.g. `datetime(a.timestamp) >= datetime() - duration({{hours: 24}})`. Also, this data is historical, not near real wall-clock time: if a "Reference time" is given below (see the question), anchor relative-time phrases like "the last N hours" to THAT timestamp instead of `datetime()` with no arguments -- real wall-clock `datetime()` will never match historical data.
 
+        14. **CRITICAL RULE**: Avoid `UNION`/`UNION ALL`. Combine alternatives with `OPTIONAL MATCH`, `collect()`, list comprehensions or `CALL {{ ... }}` subqueries instead. If you do use UNION, every branch MUST return exactly the same column names, in the same order (use `AS` aliases, and `null AS x` for a column a branch lacks); otherwise Neo4j rejects the whole query.
+        15. **CRITICAL RULE**: IP, User and MitreTechnique edges exist only when the sensor parsed that field. Many alerts (for example anomaly-detector and log-file alerts) have NO `ATTACK_TO`/`CONNECTS_TO`/`TARGETS_USER` edge even when the IP or user appears in their `full_log`. A pattern such as `(ip:IP {{id: "x"}})-[:ATTACK_TO]->(a:Alert)` therefore silently misses them. When an IP, user or domain is the anchor, match the alert through `(h:Host)-[:HAS_ALERT]->(a:Alert)` and use `OPTIONAL MATCH` for the IP/User edge, OR'd with `a.full_log CONTAINS "x"`, e.g. `MATCH (h:Host)-[:HAS_ALERT]->(a:Alert) OPTIONAL MATCH (src:IP)-[:ATTACK_TO]->(a) WITH h, a, src WHERE src.id = "x" OR a.full_log CONTAINS "x"`.
+        16. **CRITICAL RULE**: Return the evidence rows themselves (alert id, timestamp, host, title, full_log), not a verdict you computed in Cypher. Do not return derived booleans or labels such as `isScanThenExploit`, `wasSuccessful` or `firstSuccessTime` built from keyword filters: a keyword filter that misses the stored wording turns into a false "no". For "did X happen / in what order" questions, return the matching rows ordered by `a.timestamp`; for large volumes, return counts plus first/last timestamps per group (e.g. per host and title) with one example alert id each, so the answer still fits in a few rows.
+        17. Keep the query to one statement, without comments, and use only double-quoted string literals.
+
 Schema:
 {schema}
 
@@ -228,7 +233,7 @@ _PLACEHOLDER_ID_RE = re.compile(
 # One regeneration, with the failure shown to the generator. The dispatcher's
 # own retry repeats the same prompt, so a deterministic generation fault
 # (placeholder anchor, rejected syntax) failed identically twice.
-_GENERATION_ATTEMPTS = 2
+_GENERATION_ATTEMPTS = 3
 
 # Filters on free text the generator cannot know: a tag that most alerts
 # lack, or a literal it guessed. Only consulted when a query returns nothing.
@@ -450,16 +455,23 @@ def query_cypher(question: str, query_timestamp: Optional[str] = None, case_scop
                                  f"not on a real entity; its result would be empty by construction")
             return generated, run_scoped_cypher(generated, case_scope)
 
-        try:
-            generated, context = attempt(base)
-        except Exception as exc:
-            if not _repairable(exc):
-                raise
-            first_error = f"{type(exc).__name__}: {exc}"
-            failed_query = last["query"]
-            generated, context = attempt(f"{base}\n\n{_repair_feedback(failed_query, first_error)}")
+        rejected = []
+        prompt = base
+        for n in range(_GENERATION_ATTEMPTS):
+            try:
+                generated, context = attempt(prompt)
+                break
+            except Exception as exc:
+                if not _repairable(exc) or n == _GENERATION_ATTEMPTS - 1:
+                    raise
+                error = f"{type(exc).__name__}: {exc}"
+                rejected.append(error)
+                # Each regeneration sees only the latest rejected query and why.
+                prompt = f"{base}\n\n{_repair_feedback(last['query'], error)}"
+        if rejected:
             context.setdefault("notes", []).append(
-                f"The first generated query was rejected ({first_error[:200]}); this is the regenerated one.")
+                f"{len(rejected)} generated quer{'y was' if len(rejected) == 1 else 'ies were'} rejected "
+                f"({rejected[-1][:200]}); this is the regenerated one.")
         else:
             filters = _guessed_filters(generated) if _is_empty(context) else []
             if filters:

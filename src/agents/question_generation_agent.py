@@ -116,6 +116,13 @@ Rules for tagging each question's `source` (apply these directly, do not estimat
 3. If it needs free-text matching against raw log narrative that structured fields won't
    capture -> 'vector'.
 4. When in doubt between 'cypher' and 'vector', prefer 'cypher' -- alert data here is structured.
+5. If the evidence names a software product or component together with a version on the TARGET
+   side (e.g. in a requested URL path, a server banner, a package or plugin name), and a known
+   vulnerability in it would change the assessment, ask one 'cskg' question of the form "Which CVEs
+   affect <product> <version>, and what are their CVSS v3 scores?", with the product name and version
+   copied exactly from the evidence. Do not ask it for the client side (a scanner's or browser's user
+   agent identifies the tool used, not a vulnerable component), and never ask cskg whether a CVE was
+   exploited here -- only the environment's own alerts can show that.
 
 What each source can and cannot actually answer -- a question outside a source's real coverage
 will just come back empty, wasting that hypothesis slot on an unfalsifiable question instead of a

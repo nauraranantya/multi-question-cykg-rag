@@ -132,7 +132,7 @@ occurred here. Keep detector-tagged, hypothesized and behaviorally supported tec
 Do not infer a specific tool, intent, successful compromise, or causal chain from a nonspecific
 anomaly. A resource-usage spike has several possible causes; a protocol error does not establish
 interception. Negative findings apply only to the retrieved evidence, not the entire environment.
-Final_answer must distinguish observations, assessment/uncertainty, and the recommended action.
+Write final_answer in the ANSWER FORMAT given at the end of this prompt.
 
 If a section's source has no data (e.g. no log data was queried), state "Not applicable for this query." for that field.
 
@@ -194,9 +194,8 @@ questions that aren't about a specific alert at all (e.g. general cybersecurity 
 Populate mitigation_suggestions with concrete response actions when recommended_priority is 'monitor' or
 'escalate'; leave it empty otherwise.
 
-If "Conversation so far" below is not N/A, this is a follow-up question inside an ongoing investigation --
-final_answer should directly address the analyst's latest question in light of what was already found,
-not restate the whole case from scratch.
+ANSWER FORMAT (final_answer only; every other field is filled as described above):
+{answer_format}
 
 **Case Context (static case fact sheet, if this belongs to a clustered investigation case):**
 {case_context}
@@ -226,6 +225,35 @@ not restate the whole case from scratch.
 {retrieval_failures}
 {retry_note}
 """)
+
+# final_answer layout. The initial report is read once, to triage: verdict
+# first, then evidence, then what is open, then actions. A follow-up is a
+# question inside a conversation: it gets a direct answer, not a new report.
+# The structured fields (claims, maliciousness, priority, ...) are produced
+# in both cases, since validation and scoring read them, not the prose.
+INITIAL_ANSWER_FORMAT = """Markdown, at most about 350 words, in exactly these parts:
+1. One or two sentences, no heading: the bottom line -- what this case most likely is, how sure you are,
+   and whether a human should look now. Do not restate the priority/confidence field values as labels.
+2. "**What the alerts show**": 3 to 6 bullets of directly observed behavior, in time order, each ending
+   with its alert ID(s) in parentheses. Observations only, no interpretation.
+3. "**Assessment**": the most likely explanation and the alternatives still open, and which hypotheses
+   were ruled out and on what evidence. Mark anything not 'supported' as unverified.
+4. "**Gaps**": bullets for what could not be checked (failed sources, invalid queries, unexamined
+   activity groups, truncated results). Write "None." if there are none.
+5. "**Actions**": at most 5 numbered actions, case-specific ones first (named hosts, accounts, IPs),
+   general hardening last. Omit this part if recommended_priority is 'ignore'."""
+
+FOLLOWUP_ANSWER_FORMAT = """This is a follow-up question inside an ongoing investigation. Answer it directly, in plain
+prose: no headings, no bullet lists unless the question asks for a list, at most about 200 words.
+The first sentence answers the question (yes/no/what/which). Then give the evidence for it, citing
+alert IDs in parentheses, and say whether it changes the earlier assessment. If the question could not
+be answered (no evidence, failed or invalid query), say so plainly and why. Do not restate the case,
+and mention actions only if this answer changes them."""
+
+
+def answer_format(is_followup: bool) -> str:
+    return FOLLOWUP_ANSWER_FORMAT if is_followup else INITIAL_ANSWER_FORMAT
+
 
 synthesis_chain = synthesis_prompt | structured_model(llm, SynthesizedReport)
 # Cost-tier routing (see src/config/settings.py::fast_llm) -- workflow.py's

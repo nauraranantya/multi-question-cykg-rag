@@ -623,6 +623,50 @@ def get_technique_mitigations_by_keyword(keywords: List[str], ctx: Context) -> s
     return execute_sparql_query(query, ctx)
 
 
+_TECHNIQUE_ID_RE = re.compile(r"^T\d{4}(?:\.\d{3})?$")
+
+
+@mcp.tool()
+def get_mitigations_for_technique_ids(technique_ids: List[str], ctx: Context) -> str:
+    """Get each ATT&CK technique's name and all of its mitigations from its ID, in one lookup.
+
+    Use this whenever techniques are known by ID (e.g. ['T1046', 'T1505.003']):
+    no name resolution step is needed. Returns one row per technique (the
+    mitigations joined with '; '), so up to 10 IDs fit in one result.
+
+    Args:
+        technique_ids: ATT&CK technique IDs, e.g. ['T1046', 'T1505.003'] (at most 10)
+        ctx: FastMCP context object
+    """
+    ids = []
+    for raw in technique_ids or []:
+        tid = str(raw).strip().upper()
+        if _TECHNIQUE_ID_RE.match(tid) and tid not in ids:
+            ids.append(tid)
+    ids = ids[:10]
+    if not ids:
+        return "Error: no valid ATT&CK technique IDs given (expected e.g. 'T1046' or 'T1505.003')."
+    values = " ".join(f'"{tid}"' for tid in ids)
+    query = f"""
+    PREFIX attack: <http://w3id.org/sepses/vocab/ref/attack#>
+    PREFIX dcterm: <http://purl.org/dc/terms/>
+
+    SELECT ?techniqueId ?techniqueLabel
+           (GROUP_CONCAT(DISTINCT COALESCE(?mitigationLabel, "none listed in ATT&CK"); separator="; ") AS ?mitigations) WHERE {{
+        VALUES ?techniqueId {{ {values} }}
+        ?technique a attack:Technique ; dcterm:title ?techniqueLabel .
+        FILTER(STRENDS(STR(?technique), CONCAT("/", ?techniqueId)))
+        OPTIONAL {{
+            ?technique attack:hasMitigation ?mitigation .
+            ?mitigation dcterm:title ?mitigationLabel .
+        }}
+    }}
+    GROUP BY ?techniqueId ?techniqueLabel
+    ORDER BY ?techniqueId
+    """
+    return execute_sparql_query(query, ctx)
+
+
 @mcp.tool()
 def get_technique_by_id(technique_id: str, ctx: Context, include_description: bool = True) -> str:
     """Get a specific MITRE ATT&CK technique or sub-technique by its ATT&CK ID.
@@ -1433,6 +1477,41 @@ def search_cves_by_keyword(keyword: str, ctx: Context, include_description: bool
         FILTER(CONTAINS(LCASE(?description), LCASE("{_literal(keyword)}")))
     }}
     LIMIT 50
+    """
+    return execute_sparql_query(query, ctx, include_description)
+
+@mcp.tool()
+def search_cves_for_product(product: str, ctx: Context, version: Optional[str] = None,
+                            include_description: bool = False) -> str:
+    """Find CVEs whose description names a software product (and optionally a version), with CVSS v3 scores.
+
+    Use this when the evidence names a product and version (in a URL path, user agent,
+    server banner or package name), e.g. product='wpDiscuz', version='7.0.4'. Matching
+    is on the CVE description text, so a version match is approximate: a CVE listing a
+    version range may not contain the exact version string. Highest scores first, at
+    most 10 rows.
+
+    Args:
+        product: Product or component name, e.g. 'wpDiscuz', 'OpenSSH', 'Apache HTTP Server'
+        ctx: FastMCP context object
+        version: Optional version string, e.g. '7.0.4'
+        include_description: Whether to include descriptions (default: False)
+    """
+    product = (product or "").strip()
+    if len(product) < 3:
+        return "Error: give a product name of at least 3 characters."
+    version_filter = (f'FILTER(CONTAINS(?description, "{_literal(version.strip())}"))'
+                      if version and version.strip() else "")
+    query = _CVE_PREFIXES + f"""
+    SELECT ?cveId ?baseScore ?severity ?description WHERE {{
+        ?cve a cve:CVE ; dcterms:identifier ?cveId ; dcterms:description ?description .
+        FILTER(CONTAINS(LCASE(?description), LCASE("{_literal(product)}")))
+        {version_filter}
+        {_CVE_TO_CVSS}
+        BIND(REPLACE(STR(?sev), "^.*/", "") AS ?severity)
+    }}
+    ORDER BY DESC(?baseScore)
+    LIMIT 10
     """
     return execute_sparql_query(query, ctx, include_description)
 

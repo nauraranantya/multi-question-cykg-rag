@@ -17,6 +17,11 @@ question that triggers it (already wrapped in NODE_CALL_TIMEOUT_SECONDS by
 src/graph/workflow.py's dispatch_retrieval_node), not process startup.
 """
 import asyncio
+import contextvars
+import hashlib
+import json
+import re
+import time
 import os
 import logging
 import time
@@ -96,13 +101,40 @@ def _ensure_step_budget_not_exhausted(steps_taken: int, max_steps: int) -> None:
         )
 
 
+_TECHNIQUE_ID_RE = re.compile(r"\bT\d{4}(?:\.\d{3})?\b")
+_CVE_ID_RE = re.compile(r"\bCVE-\d{4}-\d{4,}\b", re.IGNORECASE)
+_CVE_TOOLS = ["get_cve_by_id", "search_cves_for_product", "search_cves_by_keyword", "get_references_for_cve"]
+
+
+def _is_cve_question(question: str) -> bool:
+    text = question.lower()
+    return bool(_CVE_ID_RE.search(question)) or 'cve' in text or 'vulnerab' in text or 'cvss' in text
+
+
 def _is_technique_mitigation_question(question: str) -> bool:
     text = question.lower()
+    if _is_cve_question(question):
+        return False
     return 'mitigation' in text or ('att&ck' in text and 'technique' in text)
 
 
-def _disallow_tools_except(tool_names, allowed_name: str) -> list[str]:
-    return [name for name in tool_names if name != allowed_name]
+def _allowed_tools(question: str):
+    """Which tools a question may use, or None for the unrestricted agent.
+    Each focused question type gets its purpose-built tool(s) only, so the
+    agent cannot spend its step budget on broad searches or on
+    text_to_sparql's separate OpenAI API call."""
+    if _is_cve_question(question):
+        return _CVE_TOOLS
+    if _is_technique_mitigation_question(question):
+        if _TECHNIQUE_ID_RE.search(question):
+            return ["get_mitigations_for_technique_ids"]
+        return ["get_technique_mitigations_by_keyword"]
+    return None
+
+
+def _disallow_tools_except(tool_names, allowed) -> list[str]:
+    allowed = {allowed} if isinstance(allowed, str) else set(allowed)
+    return [name for name in tool_names if name not in allowed]
 
 # Exact marker MAX_STEPS-exhausted/nothing-found responses must start
 # with -- src/graph/workflow.py::_context_richness matches on this (plus a
@@ -119,6 +151,8 @@ You are a specialized cybersecurity assistant. You MUST answer questions ONLY by
 
 Keep retrieval bounded: use the fewest tool calls that can answer the question, prefer one precise lookup, and do not request exhaustive lists. If a call times out, do not repeat the same query; make at most one narrower fallback. The tool loop is limited to {MCP_MAX_STEPS} steps, and each result is capped at {MCP_MAX_RESULT_ROWS} rows.
 
+When techniques are already known by ID (e.g. T1046, T1505.003) and their mitigations are asked for, make ONE call to get_mitigations_for_technique_ids with all the IDs; it returns each technique's name and mitigations.
+When the question asks which CVEs affect a named software product or version, use search_cves_for_product (product, and version if known); use get_cve_by_id for a known CVE ID. Report each CVE ID with its CVSS v3 base score and severity exactly as returned, say that matching is on description text so version ranges may be missed, and never claim that a CVE was exploited in this environment.
 When asked to map observed behavior to ATT&CK techniques and/or recommend mitigations, use get_technique_mitigations_by_keyword with a list of up to three concise phrases drawn from the observed signals (for example, the relevant service behavior, a scan/banner phrase, and a DNS query type). Make one call; only if it returns no results, make one fallback call with alternate short phrases. It returns bounded technique IDs/titles and linked mitigation titles. Never use text_to_sparql for these tasks: it makes a separate hard-coded OpenAI GPT-4o API call, bypassing the configured OpenRouter model/provider. Do not replace graph evidence with memory, or search technique and mitigation tools separately.
 
 This knowledge base ONLY contains public reference data: MITRE ATT&CK techniques/tactics/groups/software/mitigations,
@@ -153,8 +187,70 @@ Your thought process MUST be:
         question -- the marker reflects that the ORIGINAL question wasn't answered, regardless of what else you add
         after it. A downstream check relies on this exact marker to tell "found nothing" apart from "found
         something" -- do not paraphrase it, and do not include it if you DID find relevant information answering the
-        question as actually asked.
+        question as actually asked. If a tool returned rows that answer PART of the question (for example the
+        mitigations but not the description), do NOT use the marker: report what was found and add one sentence
+        naming the part that could not be retrieved.
 """
+
+# --- Per-question trace of knowledge-graph tool calls ---------------------
+# Recorded with each question result, so an evaluation can tell which tools
+# were used, with which arguments, and what they returned. A call's start
+# time and duration also join it to the server's per-query telemetry
+# (cskg_events: query hash, cache hit/miss, failures).
+_TRACE = contextvars.ContextVar("cskg_trace", default=None)
+_TRACE_PREVIEW_CHARS = 400
+_TRACE_ARGUMENT_CHARS = 500
+
+
+def start_trace() -> dict:
+    """Begin collecting a trace for the next run_mcp_agent call in this
+    context (asyncio tasks created afterwards share the same dict)."""
+    trace = {"allowed_tools": None, "max_steps": None, "steps": None, "tools_used": [], "calls": []}
+    _TRACE.set(trace)
+    return trace
+
+
+def _result_text(result) -> str:
+    parts = []
+    for item in getattr(result, "content", None) or []:
+        text = getattr(item, "text", None)
+        parts.append(text if isinstance(text, str) else str(item))
+    return "\n".join(parts) if parts else str(result)
+
+
+def _instrument_connector(connector) -> None:
+    """Wrap one MCP connector's call_tool once. The tool adapters look the
+    method up on every call, so the wrapper sees every agent tool call."""
+    if getattr(connector, "_cskg_trace_wrapped", False):
+        return
+    original = connector.call_tool
+
+    async def call_tool(name, arguments, *args, **kwargs):
+        trace = _TRACE.get()
+        started = time.time()
+        record = {"tool": name, "arguments": json.dumps(arguments, default=str)[:_TRACE_ARGUMENT_CHARS],
+                  "started": round(started, 3)}
+        try:
+            result = await original(name, arguments, *args, **kwargs)
+        except Exception as exc:
+            if trace is not None:
+                trace["calls"].append({**record, "seconds": round(time.time() - started, 3),
+                                       "status": "exception", "error_type": type(exc).__name__})
+            raise
+        if trace is not None:
+            text = _result_text(result)
+            trace["calls"].append({
+                **record, "seconds": round(time.time() - started, 3),
+                "status": "tool_error" if getattr(result, "isError", False) else "ok",
+                "result_chars": len(text),
+                "result_sha256": hashlib.sha256(text.encode()).hexdigest(),
+                "result_preview": text[:_TRACE_PREVIEW_CHARS],
+            })
+        return result
+
+    connector.call_tool = call_tool
+    connector._cskg_trace_wrapped = True
+
 
 async def run_mcp_agent(question: str) -> str:
     """
@@ -175,25 +271,29 @@ async def run_mcp_agent(question: str) -> str:
     try:
         client = get_mcp_client()  # imports mcp_use as a side effect -- see module docstring
         from mcp_use import MCPAgent
-        tool_limited = _is_technique_mitigation_question(question)
+        allowed = _allowed_tools(question)
         disallowed_tools = []
         agent_steps = MCP_MAX_STEPS
-        if tool_limited:
+        if not client.get_all_active_sessions():
+            await client.create_all_sessions()
+        for session in client.get_all_active_sessions().values():
+            _instrument_connector(session.connector)
+        if allowed:
             # A focused ATT&CK mapping query has a single purpose-built tool.
             # Discover its registered name first, then hide the other 42
             # options from the agent so it cannot spend its budget on broad
             # searches or text_to_sparql's separate OpenAI API call.
-            if not client.get_all_active_sessions():
-                await client.create_all_sessions()
             tool_names = []
             for session in client.get_all_active_sessions().values():
                 tool_names.extend(tool.name for tool in await session.connector.list_tools())
-            allowed = "get_technique_mitigations_by_keyword"
-            if allowed not in tool_names:
+            missing = [name for name in allowed if name not in tool_names]
+            if missing:
                 raise CskgDependencyError(
-                    f"Required MCP tool is unavailable: {allowed}", stage="agent_tool_missing")
+                    f"Required MCP tool is unavailable: {', '.join(missing)}", stage="agent_tool_missing")
             disallowed_tools = _disallow_tools_except(tool_names, allowed)
-            agent_steps = min(MCP_MAX_STEPS, 3)  # one lookup, one fallback, one final response
+            # ATT&CK: one lookup, one fallback, one final response. CVE: up to
+            # two product/ID lookups and one score/reference follow-up.
+            agent_steps = min(MCP_MAX_STEPS, 5 if allowed is _CVE_TOOLS else 3)
         agent = MCPAgent(
             llm=llm,
             client=client,
@@ -203,7 +303,12 @@ async def run_mcp_agent(question: str) -> str:
             disallowed_tools=disallowed_tools,
         )
         generator = agent.stream(question, track_execution=False)
+        trace = _TRACE.get()
+        if trace is not None:
+            trace.update(allowed_tools=list(allowed) if allowed else None, max_steps=agent_steps)
         result, steps_taken, tools_used_names = await agent._consume_and_return(generator)
+        if trace is not None:
+            trace.update(steps=steps_taken, tools_used=list(tools_used_names or []))
         # mcp_use returns its current text when max_steps is reached. That
         # text can omit required parts of the answer (for example,
         # mitigations after several broad searches), so it must not be
