@@ -849,7 +849,13 @@ def synthesize_node(state: AgentState):
     source_status = state.get('source_status') or {}
     synthesizer_logger.info(f"invoked (mode={mode}, tier={'full' if mode in ('full_hypothesis', 'single_interpretation') else 'fast'})")
 
-    if not state.get('mcp_rdf_context') and log_cypher == "Not applicable for this query." and log_vector == "Not applicable for this query.":
+    no_retrieved_evidence = (not state.get('mcp_rdf_context') and log_cypher == "Not applicable for this query."
+                             and log_vector == "Not applicable for this query.")
+    # Retrieval that ran and found nothing is itself a finding, and the
+    # case's own alerts (case_context) are still evidence to report on: the
+    # synthesizer must assess them rather than answer "no information".
+    # Only an outage, or a turn with no case alerts at all, short-circuits.
+    if no_retrieved_evidence and (failures or not (state.get('case_context') or '').strip()):
         if failures:
             # No evidence because sources FAILED is a different statement
             # from "nothing relevant exists" -- never report an outage as

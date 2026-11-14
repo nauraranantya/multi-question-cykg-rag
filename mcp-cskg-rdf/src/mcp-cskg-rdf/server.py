@@ -392,7 +392,10 @@ def set_max_tokens(tokens: int, ctx: Context) -> str:
     logger.info(f"Set MAX_TOKENS to {tokens}")
     return f"MAX_TOKENS set to {tokens}"
 
-_CVE_FAMILY = re.compile(r"w3id\.org/sepses/vocab/ref/(?:cve|cvss|cwe|capec|cpe|icsa)#")
+# The live SEPSES-KG (sepses.org) moved the CVE family from
+# http://w3id.org/sepses/vocab/ref/... to https://sepses.org/vocab/ref/...;
+# both spellings route to the endpoint.
+_CVE_FAMILY = re.compile(r"(?:w3id\.org/sepses|sepses\.org)/vocab/ref/(?:cve|cvss|cwe|capec|cpe|icsa)#")
 _ATTACK_VOCAB = re.compile(r"w3id\.org/sepses/vocab/ref/attack#")
 
 
@@ -1379,8 +1382,10 @@ async def get_group_capabilities(group_name: str, ctx: Context, include_descript
 #################################################################
 # CVE Query Tools
 #################################################################
-# Written for the SEPSES-KG schema served at https://sepses.org/sparql
-# (verified 2026-10-26): CVE IRIs are .../resource/cve/<CVE-ID> with
+# Written for the SEPSES-KG served by QLever at https://sepses.org/qlever/api/
+# (checked live 2026-11-14: the Virtuoso editor at /sparql holds no CVE data;
+# resources are https://sepses.org/resource/..., the vocabulary is still
+# http://w3id.org/sepses/vocab/ref/...): CVE IRIs are .../resource/cve/<CVE-ID> with
 # dcterms:identifier/description/issued/modified and cve:hasReference;
 # CVSS v3 records are NOT linked from the CVE but sit at the parallel IRI
 # .../resource/cvss/CVSS3BaseMetric/<CVE-ID>, with a numeric cvss:baseScore,
@@ -1392,17 +1397,19 @@ _CVE_PREFIXES = """
     PREFIX dcterms: <http://purl.org/dc/terms/>
     PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
 """
-_CVE_IRI = "http://w3id.org/sepses/resource/cve/"
-_CVSS3_IRI = "http://w3id.org/sepses/resource/cvss/CVSS3BaseMetric/"
+_CVE_IRI = "https://sepses.org/resource/cve/"
+_CVSS3_IRI = "https://sepses.org/resource/cvss/CVSS3BaseMetric/"
 _CVE_ID_RE = re.compile(r"^CVE-\d{4}-\d{4,}$")
 # From a CVSS v3 record to its CVE (cheap: filters on the score first).
-_CVSS_TO_CVE = f'BIND(IRI(CONCAT("{_CVE_IRI}", STRAFTER(STR(?cvss3), "/CVSS3BaseMetric/"))) AS ?cve)'
+_CVSS_TO_CVE = '?cve cve:hasCVSS3BaseMetric ?cvss3 .'
 # From a CVE to its (optional) CVSS v3 score and severity. The BIND must sit
 # outside the OPTIONAL: inside it, ?cve is not yet bound and the join
 # silently pairs every CVE with every CVSS record.
-_CVE_TO_CVSS = (f'BIND(IRI(CONCAT("{_CVSS3_IRI}", STRAFTER(STR(?cve), "/cve/"))) AS ?cvss3) '
-                f'OPTIONAL {{ ?cvss3 cvss:baseScore ?baseScore . '
-                f'OPTIONAL {{ ?cvss3 cvss:baseSeverity ?sev }} }}')
+# On the live QLever endpoint (checked 2026-11-14) a constant or constructed
+# resource IRI matches nothing, so CVEs are matched by dcterms:identifier
+# and the CVSS record is reached through the cve:hasCVSS3BaseMetric link.
+_CVE_TO_CVSS = ('OPTIONAL { ?cve cve:hasCVSS3BaseMetric ?cvss3 . ?cvss3 cvss:baseScore ?baseScore . '
+                'OPTIONAL { ?cvss3 cvss:baseSeverity ?sev } }')
 
 
 def _normalize_cve_id(cve_id: str) -> Optional[str]:
@@ -1446,16 +1453,16 @@ def get_cve_by_id(cve_id: str, ctx: Context, include_description: bool = False) 
         return f"Error: {cve_id!r} is not a CVE identifier (expected e.g. CVE-2021-44228)."
     query = _CVE_PREFIXES + f"""
     SELECT ?cveId ?description ?publishedDate ?modifiedDate ?baseScore ?severity ?vector WHERE {{
-        VALUES ?cve {{ <{_CVE_IRI}{normalized}> }}
-        ?cve a cve:CVE .
+        ?cve a cve:CVE ; dcterms:identifier "{normalized}" .
         BIND("{normalized}" AS ?cveId)
         OPTIONAL {{ ?cve dcterms:description ?description }}
         OPTIONAL {{ ?cve dcterms:issued ?publishedDate }}
         OPTIONAL {{ ?cve dcterms:modified ?modifiedDate }}
         OPTIONAL {{
-            <{_CVSS3_IRI}{normalized}> cvss:baseScore ?baseScore .
-            OPTIONAL {{ <{_CVSS3_IRI}{normalized}> cvss:vectorString ?vector }}
-            OPTIONAL {{ <{_CVSS3_IRI}{normalized}> cvss:baseSeverity ?sev }}
+            ?cve cve:hasCVSS3BaseMetric ?cvss3 .
+            ?cvss3 cvss:baseScore ?baseScore .
+            OPTIONAL {{ ?cvss3 cvss:vectorString ?vector }}
+            OPTIONAL {{ ?cvss3 cvss:baseSeverity ?sev }}
         }}
         BIND(REPLACE(STR(?sev), "^.*/", "") AS ?severity)
     }}
@@ -1500,13 +1507,16 @@ def search_cves_for_product(product: str, ctx: Context, version: Optional[str] =
     product = (product or "").strip()
     if len(product) < 3:
         return "Error: give a product name of at least 3 characters."
-    version_filter = (f'FILTER(CONTAINS(?description, "{_literal(version.strip())}"))'
-                      if version and version.strip() else "")
+    name = _literal(product)
+    # Description text only. Matching the CVE's CPE list for the exact
+    # product and version was tried (2026-11-14) and takes ~30 s on the live
+    # endpoint, which is the request timeout.
+    version_filter = f' && CONTAINS(?text, "{_literal(version.strip())}")' if version and version.strip() else ""
+    match = f"""
+        ?cve dcterms:description ?text . FILTER(CONTAINS(LCASE(?text), LCASE("{name}")){version_filter})"""
     query = _CVE_PREFIXES + f"""
-    SELECT ?cveId ?baseScore ?severity ?description WHERE {{
+    SELECT DISTINCT ?cveId ?baseScore ?severity ?description WHERE {{{match}
         ?cve a cve:CVE ; dcterms:identifier ?cveId ; dcterms:description ?description .
-        FILTER(CONTAINS(LCASE(?description), LCASE("{_literal(product)}")))
-        {version_filter}
         {_CVE_TO_CVSS}
         BIND(REPLACE(STR(?sev), "^.*/", "") AS ?severity)
     }}
@@ -1587,9 +1597,9 @@ def get_references_for_cve(cve_id: str, ctx: Context, include_description: bool 
     # separate values, so tags cannot be paired with individual URLs.
     query = _CVE_PREFIXES + f"""
     SELECT DISTINCT ?referenceUrl ?referenceSource WHERE {{
-        <{_CVE_IRI}{normalized}> cve:hasReference ?reference .
+        ?cve dcterms:identifier "{normalized}" ; cve:hasReference ?reference .
         ?reference cve:referenceUrl ?referenceUrl .
-        OPTIONAL {{ ?reference cve:referenceSource ?referenceSource }}
+        OPTIONAL {{ ?reference cve:referenceName ?referenceSource }}
     }}
     ORDER BY ?referenceUrl
     """
@@ -1683,11 +1693,12 @@ follow these shapes exactly, don't invent alternate predicate names:
   ?software a attack:Software|attack:Malware ; dcterm:title ?label .
   ?cve a cve:CVE ; dcterms:identifier ?cveId ; dcterms:description ?desc ;
     dcterms:issued ?published ; dcterms:modified ?modified .
-  CVSS v3 is NOT linked from the CVE: it sits at the parallel IRI
-    <http://w3id.org/sepses/resource/cvss/CVSS3BaseMetric/CVE-2021-44228>
-    with cvss:baseScore (numeric) and cvss:baseSeverity. Join with
-    BIND(IRI(CONCAT("http://w3id.org/sepses/resource/cvss/CVSS3BaseMetric/",
-    STRAFTER(STR(?cve), "/cve/"))) AS ?cvss3).
+  Find a CVE by ?cve dcterms:identifier "CVE-2021-44228" -- never by writing
+  its IRI as a constant, which matches nothing on this endpoint.
+  CVSS v3: ?cve cve:hasCVSS3BaseMetric ?cvss3 . ?cvss3 cvss:baseScore ?score ;
+    cvss:baseSeverity ?severity ; cvss:vectorString ?vector .
+    (the CVSS record's IRI is <https://sepses.org/resource/cvss/CVSS3BaseMetric/CVE-2021-44228>)
+  Other CVE links: cve:hasCWE ?cwe ; cve:hasCPE ?cpe ; cve:hasReference ?ref .
 
 Rules, matching this knowledge base's own conventions:
   - Match technique/tactic/group/mitigation/software NAMES via
